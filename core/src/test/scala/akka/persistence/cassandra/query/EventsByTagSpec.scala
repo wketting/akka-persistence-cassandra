@@ -88,6 +88,10 @@ object EventsByTagSpec {
   val strictConfigFirstOffset1001DaysAgo = ConfigFactory.parseString(s"""
     cassandra-query-journal.first-time-bucket = ${TimeBucket(today.minusDays(1001)).key}
     """).withFallback(strictConfig)
+
+  val strictConfigWithLargeMaxBufferSize = ConfigFactory.parseString(s"""
+    cassandra-query-journal.max-buffer-size = 20002
+    """).withFallback(strictConfig)
 }
 
 class ColorFruitTagger extends WriteEventAdapter {
@@ -847,6 +851,39 @@ class EventsByTagStrictBySeqNoEarlyFirstOffsetSpec
       probe.request(2000)
       probe.expectNextN(2000)
       probe.cancel()
+    }
+  }
+}
+
+class CurrentEventsByTagStrictBySeqNoBacktrackLoopSpec
+  extends AbstractEventsByTagSpec("EventsByTagStrictBySeqNoEarlyFirstOffsetSpec", EventsByTagSpec.strictConfigWithLargeMaxBufferSize) {
+  import EventsByTagSpec._
+
+  "Cassandra currentEventsByTag with delayed-event-timeout > 0s and backtracking triggered in the last (current) timebucket" must {
+    "find all events and close the stream after backtracking has finished" in {
+      val t1 = LocalDateTime.now(ZoneOffset.UTC).minusHours(15)
+      val t2 = t1.minusMinutes(1)
+      val w1 = UUID.randomUUID().toString
+      val w2 = UUID.randomUUID().toString
+
+      // create enough events on the current day to be sure that delayed event backtracking is
+      // triggered when during the last (current) timebucket
+      (1L to 10000L).foreach { n =>
+        val eventA = PersistentRepr(s"A$n", n, "a", "", writerUuid = w1)
+        val eventB = PersistentRepr(s"B$n", n, "b", "", writerUuid = w2)
+        writeTestEvent(t1.plus(n*5, ChronoUnit.SECONDS), eventA, Set("T11"))
+        writeTestEvent(t2.plus(n*5, ChronoUnit.SECONDS), eventB, Set("T11"))
+      }
+
+      val eventA = PersistentRepr(s"Ztest", 1, "z", "", writerUuid = w1)
+      writeTestEvent(LocalDateTime.now(ZoneOffset.UTC).minusMinutes(1), eventA, Set("T11"))
+
+      val src = queries.currentEventsByTag(tag = "T11", offset = NoOffset)
+      val probe = src.runWith(TestSink.probe[Any])
+      probe.request(20001)
+      probe.expectNextN(20001)
+      // Expecting the stream to be complete after backtracking during current timebucket
+      probe.expectComplete()
     }
   }
 }
